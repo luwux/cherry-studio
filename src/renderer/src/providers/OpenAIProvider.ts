@@ -15,7 +15,7 @@ import {
 } from 'openai/resources'
 
 import { CompletionsParams } from '.'
-import BaseProvider from './BaseProvider'
+import BaseProvider, { SmoothTextOutput } from './BaseProvider'
 
 export default class OpenAIProvider extends BaseProvider {
   private sdk: OpenAI
@@ -46,6 +46,12 @@ export default class OpenAIProvider extends BaseProvider {
     return providers.includes(this.provider.id)
   }
 
+  // Override shouldUseSmoothOutput to customize when to use smooth output
+  protected shouldUseSmoothOutput(): boolean {
+    // Always enable for a smoother experience
+    return true
+  }
+
   private async getMessageParam(
     message: Message,
     model: Model
@@ -63,24 +69,20 @@ export default class OpenAIProvider extends BaseProvider {
     if (this.isNotSupportFiles) {
       if (message.files) {
         const textFiles = message.files.filter((file) => [FileTypes.TEXT, FileTypes.DOCUMENT].includes(file.type))
-
         if (textFiles.length > 0) {
           let text = ''
           const divider = '\n\n---\n\n'
-
           for (const file of textFiles) {
             const fileContent = (await window.api.file.read(file.id + file.ext)).trim()
             const fileNameRow = 'file: ' + file.origin_name + '\n\n'
             text = text + fileNameRow + fileContent + divider
           }
-
           return {
             role: message.role,
             content: content + divider + text
           }
         }
       }
-
       return {
         role: message.role,
         content
@@ -119,7 +121,6 @@ export default class OpenAIProvider extends BaseProvider {
 
   private getTemperature(assistant: Assistant, model: Model) {
     if (isReasoningModel(model)) return undefined
-
     return assistant?.settings?.temperature
   }
 
@@ -146,7 +147,6 @@ export default class OpenAIProvider extends BaseProvider {
 
   private getTopP(assistant: Assistant, model: Model) {
     if (isReasoningModel(model)) return undefined
-
     return assistant?.settings?.topP
   }
 
@@ -154,13 +154,11 @@ export default class OpenAIProvider extends BaseProvider {
     if (this.provider.id === 'groq') {
       return {}
     }
-
     if (isReasoningModel(model)) {
       return {
         reasoning_effort: assistant?.settings?.reasoning_effort
       }
     }
-
     return {}
   }
 
@@ -245,6 +243,14 @@ export default class OpenAIProvider extends BaseProvider {
     const { abortController, cleanup } = this.createAbortController(lastUserMessage?.id)
     const { signal } = abortController
 
+    // Create smooth text output instance
+    const useSmoothOutput = this.shouldUseSmoothOutput() && streamOutput
+    let smoothOutput: SmoothTextOutput | null = null
+
+    if (useSmoothOutput) {
+      smoothOutput = this.createSmoothTextOutput(onChunk)
+    }
+
     const stream = await this.sdk.chat.completions
       // @ts-ignore key is not typed
       .create(
@@ -254,7 +260,7 @@ export default class OpenAIProvider extends BaseProvider {
           temperature: this.getTemperature(assistant, model),
           top_p: this.getTopP(assistant, model),
           max_tokens: maxTokens,
-          keep_alive: this.keepAliveTime,
+          keep_alive: this.keepAliveTime, // ?
           stream: isSupportStreamOutput(),
           ...getOpenAIWebSearchParams(assistant, model),
           ...this.getReasoningEffort(assistant, model),
@@ -283,6 +289,9 @@ export default class OpenAIProvider extends BaseProvider {
     // @ts-expect-error `stream` is not typed
     for await (const chunk of stream) {
       if (window.keyv.get(EVENT_NAMES.CHAT_COMPLETION_PAUSED)) {
+        if (smoothOutput) {
+          smoothOutput.abort()
+        }
         break
       }
 
@@ -306,19 +315,37 @@ export default class OpenAIProvider extends BaseProvider {
       // Extract citations from the raw response if available
       const citations = (chunk as OpenAI.Chat.Completions.ChatCompletionChunk & { citations?: string[] })?.citations
 
-      onChunk({
-        text: delta?.content || '',
-        // @ts-ignore key is not typed
-        reasoning_content: delta?.reasoning_content || delta?.reasoning || '',
-        usage: chunk.usage,
-        metrics: {
-          completion_tokens: chunk.usage?.completion_tokens,
-          time_completion_millsec,
-          time_first_token_millsec,
-          time_thinking_millsec
-        },
-        citations
-      })
+      const metrics = {
+        completion_tokens: chunk.usage?.completion_tokens,
+        time_completion_millsec,
+        time_first_token_millsec,
+        time_thinking_millsec
+      }
+
+      // Use smooth character-by-character output if enabled
+      if (smoothOutput) {
+        smoothOutput.append(
+          delta?.content || '',
+          delta?.reasoning_content || delta?.reasoning || '',
+          { usage: chunk.usage, ...metrics },
+          citations
+        )
+      } else {
+        // Standard output without smoothing
+        onChunk({
+          text: delta?.content || '',
+          // @ts-ignore key is not typed
+          reasoning_content: delta?.reasoning_content || delta?.reasoning || '',
+          usage: chunk.usage,
+          metrics,
+          citations
+        })
+      }
+    }
+
+    // Flush any remaining text in the buffer
+    if (smoothOutput) {
+      smoothOutput.flush()
     }
   }
 
@@ -346,6 +373,17 @@ export default class OpenAIProvider extends BaseProvider {
 
     const stream = isSupportedStreamOutput()
 
+    // Create smooth output instance if streaming is supported
+    let fullText = ''
+    let smoothOutput: SmoothTextOutput | null = null
+
+    if (stream && this.shouldUseSmoothOutput() && onResponse) {
+      smoothOutput = new SmoothTextOutput((text) => {
+        fullText += text
+        onResponse(fullText)
+      })
+    }
+
     // @ts-ignore key is not typed
     const response = await this.sdk.chat.completions.create({
       model: model.id,
@@ -362,8 +400,18 @@ export default class OpenAIProvider extends BaseProvider {
     let text = ''
 
     for await (const chunk of response) {
-      text += chunk.choices[0]?.delta?.content || ''
-      onResponse?.(text)
+      const chunkContent = chunk.choices[0]?.delta?.content || ''
+      text += chunkContent
+
+      if (smoothOutput) {
+        smoothOutput.append(chunkContent)
+      } else if (onResponse) {
+        onResponse(text)
+      }
+    }
+
+    if (smoothOutput) {
+      smoothOutput.flush()
     }
 
     return text
@@ -460,7 +508,6 @@ export default class OpenAIProvider extends BaseProvider {
 
     try {
       const response = await this.sdk.chat.completions.create(body as ChatCompletionCreateParamsNonStreaming)
-
       return {
         valid: Boolean(response?.choices[0].message),
         error: null
@@ -502,7 +549,6 @@ export default class OpenAIProvider extends BaseProvider {
       }
 
       const models = response?.data || []
-
       return models.filter(isSupportedModel)
     } catch (error) {
       return []
@@ -546,6 +592,7 @@ export default class OpenAIProvider extends BaseProvider {
       model: model.id,
       input: model?.provider === 'baidu-cloud' ? ['hi'] : 'hi'
     })
+
     return data.data[0].embedding.length
   }
 }

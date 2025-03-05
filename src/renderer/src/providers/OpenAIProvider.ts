@@ -378,17 +378,16 @@ export default class OpenAIProvider extends BaseProvider {
 
         if (delta?.tool_calls) {
           const chunkToolCalls: OpenAI.Chat.Completions.ChatCompletionChunk.Choice.Delta.ToolCall[] = delta.tool_calls
-          if (chunk.choices[0].finish_reason !== 'tool_calls') {
-            if (toolCalls.length === 0) {
-              for (const toolCall of chunkToolCalls) {
-                toolCalls.push(toolCall as ChatCompletionMessageToolCall)
-              }
-            } else {
-              for (let i = 0; i < chunkToolCalls.length; i++) {
-                toolCalls[i].function.arguments += chunkToolCalls[i].function?.arguments || ''
-              }
-            }
-            continue
+          if (toolCalls.length === 0) {
+            // initialize toolCalls from API response: streamed or at once
+            chunkToolCalls.forEach((toolCall) => {
+              toolCalls.push(toolCall as ChatCompletionMessageToolCall)
+            })
+          } else {
+            // handle following streamed toolCalls
+            chunkToolCalls.forEach((chunkToolCall, index) => {
+              toolCalls[index].function.arguments += chunkToolCall.function?.arguments || ''
+            })
           }
         }
 
